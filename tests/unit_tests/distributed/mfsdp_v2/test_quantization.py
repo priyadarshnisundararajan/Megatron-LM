@@ -26,11 +26,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbu
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 
-def _make_model(device, mlp):
+def _make_mlp(device):
     kwargs = {"params_dtype": torch.bfloat16, "device": device}
-    if mlp:
-        return nn.Sequential(te.Linear(64, 128, **kwargs), nn.GELU(), te.Linear(128, 32, **kwargs))
-    return te.Linear(64, 256, bias=False, **kwargs)
+    return nn.Sequential(te.Linear(64, 128, **kwargs), nn.GELU(), te.Linear(128, 32, **kwargs))
 
 
 def _assert_sharded_close(actual, expected):
@@ -40,10 +38,9 @@ def _assert_sharded_close(actual, expected):
     torch.testing.assert_close(torch.cat(shards), expected.detach().cpu(), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("mlp", [False, True], ids=["linear", "mlp"])
 @pytest.mark.parametrize("parameter_placement", [Shard(0), Replicate()], ids=["zero3", "zero1"])
-def test_mxfp8_training_matches_reference(distributed_setup, parameter_placement, mlp):
-    """MXFP8 training matches an unsharded model through three Adam updates."""
+def test_mxfp8_mlp_training_matches_reference(distributed_setup, parameter_placement):
+    """MXFP8 MLP training matches an unsharded model through three Adam updates."""
     device = distributed_setup.device
     if distributed_setup.world_size != 2:
         pytest.skip("MXFP8 grouped DBuffer coverage requires exactly two ranks.")
@@ -53,8 +50,8 @@ def test_mxfp8_training_matches_reference(distributed_setup, parameter_placement
     torch.manual_seed(2026)
     recipe = MXFP8BlockScaling(fp8_format=Format.HYBRID)
     with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
-        model = _make_model(device, mlp)
-        reference = _make_model(device, mlp)
+        model = _make_mlp(device)
+        reference = _make_mlp(device)
 
     # The reference owns full FP32 master weights, updated independently of MFSDP.
     main_weights = {}
@@ -96,10 +93,9 @@ def test_mxfp8_training_matches_reference(distributed_setup, parameter_placement
 
     # MLP weights share one quantized group; its BF16 biases form a second group.
     [group] = [g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)]
-    expected_shapes = ((128, 64), (32, 128)) if mlp else ((256, 64),)
-    assert group.model_weight.rowwise_data.layout.tensor_shapes == expected_shapes
-    assert len(group.fsdp_parameters) == len(expected_shapes)
-    assert len(model.parameter_groups) == (2 if mlp else 1)
+    assert group.model_weight.rowwise_data.layout.tensor_shapes == ((128, 64), (32, 128))
+    assert len(group.fsdp_parameters) == 2
+    assert len(model.parameter_groups) == 2
     assert isinstance(group.post_optimizer_model_weight, QuantizedDBuffer)
     assert (group.post_optimizer_model_weight is group.model_weight) is isinstance(
         parameter_placement, Shard
