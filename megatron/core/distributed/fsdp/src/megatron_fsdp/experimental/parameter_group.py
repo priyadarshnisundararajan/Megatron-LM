@@ -34,16 +34,15 @@ from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .placement import BlockAtomic
 
 if HAVE_TE:
-    from .quantized_dbuffer import QuantizedDBuffer
+    from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
 else:
 
     class QuantizedDBuffer:
         """Fallback for parameter grouping when Transformer Engine is unavailable."""
 
-        @staticmethod
-        def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
-            """Without TE, all parameters use their native storage dtype."""
-            return tensor.dtype
+    def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
+        """Without TE, all parameters use their native storage dtype."""
+        return tensor.dtype
 
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -179,13 +178,13 @@ class FsdpParameterGroup:
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
         first_parameter = next(iter(parameter_to_fqns))
-        dtype = QuantizedDBuffer.effective_dtype(first_parameter)
+        dtype = effective_dtype(first_parameter)
         requires_grad = first_parameter.requires_grad
         for parameter, fqns in parameter_to_fqns.items():
-            if QuantizedDBuffer.effective_dtype(parameter) != dtype:
+            if effective_dtype(parameter) != dtype:
                 raise ValueError(
                     f"Expected parameter {fqns!r} to have dtype {dtype}, "
-                    f"got {QuantizedDBuffer.effective_dtype(parameter)}."
+                    f"got {effective_dtype(parameter)}."
                 )
             if parameter.requires_grad != requires_grad:
                 raise ValueError(

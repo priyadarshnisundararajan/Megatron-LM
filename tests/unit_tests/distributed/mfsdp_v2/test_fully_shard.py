@@ -26,6 +26,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import BlockAtomic
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer import (
     QuantizedDBuffer,
+    effective_dtype,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
@@ -43,7 +44,7 @@ def _check_mxfp8_training_against_reference(
     for name, parameter in model.named_parameters():
         initial_value = (
             parameter.get_high_precision_init_val()
-            if QuantizedDBuffer.effective_dtype(parameter) == torch.uint8
+            if effective_dtype(parameter) == torch.uint8
             else parameter.detach()
         )
         reference_main_weights[name] = nn.Parameter(
@@ -53,7 +54,7 @@ def _check_mxfp8_training_against_reference(
     def sync_reference_weights():
         with torch.no_grad():
             for name, parameter in reference_parameters.items():
-                if QuantizedDBuffer.effective_dtype(parameter) == torch.uint8:
+                if effective_dtype(parameter) == torch.uint8:
                     parameter.quantize_(reference_main_weights[name])
                 else:
                     parameter.copy_(reference_main_weights[name])
