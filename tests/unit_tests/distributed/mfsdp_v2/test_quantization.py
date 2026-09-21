@@ -9,7 +9,7 @@ import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard
-from transformer_engine.common.recipe import Format, MXFP8BlockScaling
+from transformer_engine.common.recipe import MXFP8BlockScaling
 from transformer_engine.pytorch.optimizers import FusedAdam
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -21,7 +21,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import BlockAtomic
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer import (
     QuantizedDBuffer,
-    effective_dtype,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
@@ -38,42 +37,26 @@ def _assert_sharded_close(actual, expected):
     torch.testing.assert_close(torch.cat(shards), expected.detach().cpu(), rtol=0, atol=0)
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+)
 @pytest.mark.parametrize("parameter_placement", [Shard(0), Replicate()], ids=["zero3", "zero1"])
 def test_mxfp8_mlp_training_matches_reference(distributed_setup, parameter_placement):
     """MXFP8 MLP training matches an unsharded model through three Adam updates."""
     device = distributed_setup.device
-    if distributed_setup.world_size != 2:
-        pytest.skip("MXFP8 grouped DBuffer coverage requires exactly two ranks.")
-    if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 10:
-        pytest.skip("MXFP8 requires Blackwell-or-newer CUDA hardware.")
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
 
     torch.manual_seed(2026)
-    recipe = MXFP8BlockScaling(fp8_format=Format.HYBRID)
+    recipe = MXFP8BlockScaling()
     with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
         model = _make_mlp(device)
-        reference = _make_mlp(device)
-
-    # The reference owns full FP32 master weights, updated independently of MFSDP.
-    main_weights = {}
-    for name, parameter in model.named_parameters():
-        initial_value = (
-            parameter.get_high_precision_init_val()
-            if effective_dtype(parameter) == torch.uint8
-            else parameter.detach()
-        )
-        main_weights[name] = nn.Parameter(
-            initial_value.to(device=device, dtype=torch.float32).clone()
-        )
-
-    @torch.no_grad()
-    def sync_reference_weights():
-        for name, parameter in reference.named_parameters():
-            if effective_dtype(parameter) == torch.uint8:
-                parameter.quantize_(main_weights[name])
-            else:
-                parameter.copy_(main_weights[name])
-
-    sync_reference_weights()
+    # Start from identical values; TE quantizes the reference's FP32 weights on each forward.
+    torch.manual_seed(2026)
+    reference = _make_mlp(device).float()
+    reference_parameters = dict(reference.named_parameters())
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     with fully_shard_context(device=device):
         fully_shard(
@@ -89,7 +72,7 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, parameter_place
         )
     sharded_parameters = dict(model.named_parameters())
     for name, parameter in sharded_parameters.items():
-        _assert_sharded_close(parameter, main_weights[name])
+        _assert_sharded_close(parameter, reference_parameters[name])
 
     # MLP weights share one quantized group; its BF16 biases form a second group.
     [group] = [g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)]
@@ -104,14 +87,14 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, parameter_place
 
     optimizer = FusedAdam(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
-    reference_optimizer = FusedAdam(list(main_weights.values()), lr=0.01)
+    reference_optimizer = FusedAdam(reference.parameters(), lr=0.01)
     # Different rank inputs make an incorrect gradient reduction observable.
     torch.manual_seed(1234 + distributed_setup.rank)
     for _ in range(3):
         optimizer.zero_grad(set_to_none=True)
-        reference.zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
         x = torch.randn(32, 64, dtype=torch.bfloat16, device=device)
-        with te.autocast(recipe=recipe):
+        with torch.autocast("cuda", dtype=torch.bfloat16), te.autocast(recipe=recipe):
             output = model(x)
             reference_output = reference(x)
         torch.testing.assert_close(output, reference_output, rtol=0, atol=0)
@@ -119,18 +102,23 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, parameter_place
         (output.float() - target.float()).square().mean().backward()
         (reference_output.float() - target.float()).square().mean().backward()
 
-        for name, parameter in reference.named_parameters():
+        for name, parameter in reference_parameters.items():
             # Average full BF16 gradients independently of MFSDP's packed reduce-scatter.
-            dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
-            _assert_sharded_close(sharded_parameters[name].grad, parameter.grad)
-            main_weights[name].grad = parameter.grad.float()
+            reference_grad = parameter.grad.bfloat16()
+            dist.all_reduce(reference_grad, op=dist.ReduceOp.AVG)
+            shards = [None] * dist.get_world_size()
+            dist.all_gather_object(shards, sharded_parameters[name].grad.to_local().cpu())
+            grad = torch.cat(shards).to(device)
+            torch.testing.assert_close(grad, reference_grad, rtol=0.02, atol=1e-4)
+            # BF16 reduction orders can round differently. Give both optimizers the
+            # same verified gradient so their weight updates can still match exactly.
+            parameter.grad = grad.float()
 
         optimizer.step()
         reference_optimizer.step()
         for name, parameter in sharded_parameters.items():
-            _assert_sharded_close(parameter, main_weights[name])
-        sync_reference_weights()
+            _assert_sharded_close(parameter, reference_parameters[name])
 
     # Also check requantization after the final optimizer update.
-    with torch.no_grad(), te.autocast(recipe=recipe):
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16), te.autocast(recipe=recipe):
         torch.testing.assert_close(model(x), reference(x), rtol=0, atol=0)
